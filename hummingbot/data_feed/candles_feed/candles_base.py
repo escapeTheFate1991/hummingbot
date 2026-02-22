@@ -255,12 +255,14 @@ class CandlesBase(NetworkBase):
                                                fixed_end_time)
         headers = self._get_rest_candles_headers()
         rest_assistant = await self._api_factory.get_rest_assistant()
+        self.logger().info(f"[HIST_DEBUG] fetch_candles REST call: url={self.candles_url} start={kwargs.get('start_time')} end={kwargs.get('end_time')}")
         candles = await rest_assistant.execute_request(url=self.candles_url,
                                                        throttler_limit_id=self._rest_throttler_limit_id,
                                                        params=params,
                                                        data=self._rest_payload(**kwargs),
                                                        headers=headers,
                                                        method=self._rest_method)
+        self.logger().info(f"[HIST_DEBUG] fetch_candles REST returned: type={type(candles).__name__} len={len(candles) if isinstance(candles, (list, dict)) else 'N/A'}")
         arr = self._parse_rest_candles(candles, end_time)
         return np.array(arr).astype(float)
 
@@ -323,14 +325,18 @@ class CandlesBase(NetworkBase):
         """
         This method fills the historical candles in the _candles deque until it reaches the maximum length.
         """
+        self.logger().info(f"[HIST_DEBUG] fill_historical_candles started, candles={len(self._candles)}/{self._candles.maxlen}")
         while not self.ready:
             await self._ws_candle_available.wait()
             try:
                 end_time = self._round_timestamp_to_interval_multiple(self._candles[0][0])
                 missing_records = self._candles.maxlen - len(self._candles)
+                self.logger().info(f"[HIST_DEBUG] Fetching {missing_records} historical candles, end_time={end_time}")
                 candles: np.ndarray = await self.fetch_candles(end_time=end_time, limit=missing_records)
+                self.logger().info(f"[HIST_DEBUG] fetch returned {len(candles)} candles, filtering < {end_time}")
                 candles = candles[candles[:, 0] < end_time]
                 records_to_add = min(missing_records, len(candles))
+                self.logger().info(f"[HIST_DEBUG] After filter: {len(candles)} candles, adding {records_to_add}. Total will be {len(self._candles) + records_to_add}/{self._candles.maxlen}")
                 self._candles.extendleft(candles[-records_to_add:][::-1])
             except asyncio.CancelledError:
                 raise
@@ -403,6 +409,7 @@ class CandlesBase(NetworkBase):
         # TODO: Isolate ping pong logic
         async for ws_response in websocket_assistant.iter_messages():
             data = ws_response.data
+            self.logger().info(f"[CANDLE_BASE_DEBUG] Raw WS data type={type(data).__name__}, preview={str(data)[:200]}")
             parsed_message = self._parse_websocket_message(data)
             # parsed messages may be ping or pong messages
             if isinstance(parsed_message, WSJSONRequest):

@@ -136,6 +136,7 @@ class HyperliquidPerpetualCandles(CandlesBase):
 
     def _parse_websocket_message(self, data):
         candles_row_dict: Dict[str, Any] = {}
+        self.logger().info(f"[CANDLE_DEBUG] WS msg received: channel={data.get('channel') if isinstance(data, dict) else type(data).__name__}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}")
         if data is not None and data.get("channel") == "candle":
             candle = data["data"]
             candles_row_dict["timestamp"] = self.ensure_timestamp_in_seconds(candle["t"])

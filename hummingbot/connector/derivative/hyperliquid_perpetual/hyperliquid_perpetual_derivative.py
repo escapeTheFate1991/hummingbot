@@ -52,7 +52,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             trading_pairs: Optional[List[str]] = None,
             trading_required: bool = True,
             domain: str = CONSTANTS.DOMAIN,
-            enable_hip3_markets: bool = True,
+            enable_hip3_markets: bool = False,
     ):
         self.hyperliquid_perpetual_address = hyperliquid_perpetual_address
         self.hyperliquid_perpetual_secret_key = hyperliquid_perpetual_secret_key
@@ -970,15 +970,39 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_balances(self):
         """
         Calls the REST API to update total and available balances.
+        Checks both perps clearinghouse AND spot clearinghouse (unified margin).
+        On Hyperliquid, USDC sits in spot and is used as margin for perps.
         """
+        quote = CONSTANTS.CURRENCY
 
+        # 1. Check perps clearinghouse (has value when positions are open)
         account_info = await self._api_post(path_url=CONSTANTS.ACCOUNT_INFO_URL,
                                             data={"type": CONSTANTS.USER_STATE_TYPE,
                                                   "user": self.hyperliquid_perpetual_address},
                                             )
-        quote = CONSTANTS.CURRENCY
-        self._account_balances[quote] = Decimal(account_info["crossMarginSummary"]["accountValue"])
-        self._account_available_balances[quote] = Decimal(account_info["withdrawable"])
+        perps_value = Decimal(account_info["crossMarginSummary"]["accountValue"])
+        perps_withdrawable = Decimal(account_info["withdrawable"])
+
+        # 2. Check spot clearinghouse for USDC (unified margin — this is where funds sit)
+        spot_usdc = Decimal("0")
+        try:
+            spot_info = await self._api_post(path_url=CONSTANTS.ACCOUNT_INFO_URL,
+                                             data={"type": "spotClearinghouseState",
+                                                   "user": self.hyperliquid_perpetual_address},
+                                             )
+            for bal in spot_info.get("balances", []):
+                if bal.get("coin") == "USDC":
+                    spot_usdc = Decimal(bal["total"]) - Decimal(bal.get("hold", "0"))
+                    break
+        except Exception as e:
+            self.logger().debug(f"Could not fetch spot balances: {e}")
+
+        # Use the larger of perps accountValue or spot USDC as the total balance
+        total_balance = max(perps_value, spot_usdc)
+        available_balance = max(perps_withdrawable, spot_usdc)
+
+        self._account_balances[quote] = total_balance
+        self._account_available_balances[quote] = available_balance
 
     async def _update_positions(self):
         all_positions = []

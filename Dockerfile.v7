@@ -1,0 +1,52 @@
+# ═══════════════════════════════════════════════════════════════════
+# Hummingbot v7 — ICT + Native Footprint Strategy
+# Built from local fork with footprint data feed in codebase
+# ═══════════════════════════════════════════════════════════════════
+FROM hummingbot/hummingbot:latest
+
+LABEL maintainer="Friday AI"
+LABEL description="ICT v7 strategy with native footprint order flow analysis"
+LABEL version="v7"
+
+USER root
+
+# ── Install additional Python deps ──
+RUN pip install --no-cache-dir \
+    requests>=2.28.0 \
+    numpy>=1.24.0 \
+    scipy>=1.10.0
+
+# ── Copy native footprint feed into Hummingbot codebase ──
+COPY hummingbot/data_feed/footprint_feed/ \
+     /home/hummingbot/hummingbot/data_feed/footprint_feed/
+
+# ── Copy strategy + aggregator wrapper ──
+COPY scripts/strategy_v7.py /home/hummingbot/scripts/strategy_v7.py
+COPY scripts/footprint_aggregator.py /home/hummingbot/scripts/footprint_aggregator.py
+
+# ── Copy headless launcher ──
+COPY scripts/launch_headless.py /home/hummingbot/scripts/launch_headless.py
+
+# ── Fix permissions ──
+RUN chown -R 1000:1000 /home/hummingbot/hummingbot/data_feed/footprint_feed/ \
+    && chown -R 1000:1000 /home/hummingbot/scripts/
+
+# ── Environment for auto-start ──
+ENV CONFIG_PASSWORD="EE#!01477410#!ee"
+ENV HB_SCRIPT="strategy_v7.py"
+
+WORKDIR /home/hummingbot
+
+# ── Launch via headless script (bypasses TUI) ──
+CMD ["conda", "run", "--no-capture-output", "-n", "hummingbot", \
+     "python", "scripts/launch_headless.py"]
+
+# ── Patch: disable HIP-3 DEX markets (reduces API calls, avoids testnet 429s) ──
+COPY hummingbot/connector/derivative/hyperliquid_perpetual/hyperliquid_perpetual_derivative.py \
+     /home/hummingbot/hummingbot/connector/derivative/hyperliquid_perpetual/hyperliquid_perpetual_derivative.py
+
+# ── Patch: candle feed debug logging ──
+COPY hummingbot/data_feed/candles_feed/candles_base.py \
+     /home/hummingbot/hummingbot/data_feed/candles_feed/candles_base.py
+COPY hummingbot/data_feed/candles_feed/hyperliquid_perpetual_candles/ \
+     /home/hummingbot/hummingbot/data_feed/candles_feed/hyperliquid_perpetual_candles/
