@@ -90,7 +90,8 @@ class ScriptStrategyBase(StrategyPyBase):
             amount: Decimal,
             order_type: OrderType,
             price=s_decimal_nan,
-            position_action=PositionAction.OPEN) -> str:
+            position_action=PositionAction.OPEN,
+            **kwargs) -> str:
         """
         A wrapper function to buy_with_specific_market.
 
@@ -100,9 +101,16 @@ class ScriptStrategyBase(StrategyPyBase):
         :param order_type: The type of the order
         :param price: An order price
         :param position_action: A position action (for perpetual market only)
+        :param **kwargs: Additional parameters to pass to the connector (e.g. trigger for stop loss/take profit)
 
         :return: The client assigned id for the new order
         """
+        # If kwargs are provided, call the connector directly to pass them through
+        if kwargs:
+            connector = self.connectors[connector_name]
+            return connector.buy(trading_pair, amount, order_type, price, position_action=position_action, **kwargs)
+
+        # Otherwise use the standard wrapper
         market_pair = self._market_trading_pair_tuple(connector_name, trading_pair)
         self.logger().debug(f"Creating {trading_pair} buy order: price: {price} amount: {amount}.")
         return self.buy_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)
@@ -113,7 +121,8 @@ class ScriptStrategyBase(StrategyPyBase):
              amount: Decimal,
              order_type: OrderType,
              price=s_decimal_nan,
-             position_action=PositionAction.OPEN) -> str:
+             position_action=PositionAction.OPEN,
+             **kwargs) -> str:
         """
         A wrapper function to sell_with_specific_market.
 
@@ -123,9 +132,16 @@ class ScriptStrategyBase(StrategyPyBase):
         :param order_type: The type of the order
         :param price: An order price
         :param position_action: A position action (for perpetual market only)
+        :param **kwargs: Additional parameters to pass to the connector (e.g. trigger for stop loss/take profit)
 
         :return: The client assigned id for the new order
         """
+        # If kwargs are provided, call the connector directly to pass them through
+        if kwargs:
+            connector = self.connectors[connector_name]
+            return connector.sell(trading_pair, amount, order_type, price, position_action=position_action, **kwargs)
+
+        # Otherwise use the standard wrapper
         market_pair = self._market_trading_pair_tuple(connector_name, trading_pair)
         self.logger().debug(f"Creating {trading_pair} sell order: price: {price} amount: {amount}.")
         return self.sell_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)

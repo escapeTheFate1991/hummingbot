@@ -511,11 +511,19 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     ) -> Tuple[str, float]:
 
         coin = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        param_order_type = {"limit": {"tif": "Gtc"}}
-        if order_type is OrderType.LIMIT_MAKER:
-            param_order_type = {"limit": {"tif": "Alo"}}
-        if order_type is OrderType.MARKET:
-            param_order_type = {"limit": {"tif": "Ioc"}}
+
+        # Check if trigger order parameters are provided
+        trigger_params = kwargs.get("trigger")
+        if trigger_params:
+            # Trigger order (stop loss or take profit)
+            param_order_type = {"trigger": trigger_params}
+        else:
+            # Regular order
+            param_order_type = {"limit": {"tif": "Gtc"}}
+            if order_type is OrderType.LIMIT_MAKER:
+                param_order_type = {"limit": {"tif": "Alo"}}
+            if order_type is OrderType.MARKET:
+                param_order_type = {"limit": {"tif": "Ioc"}}
 
         api_params = {
             "type": "order",

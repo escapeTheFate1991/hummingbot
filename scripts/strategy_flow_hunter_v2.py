@@ -64,11 +64,13 @@ from hummingbot.data_feed.footprint_feed import FootprintFeed, FootprintConfig
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-# Trading sessions (ET hours converted to UTC)
+# Trading sessions (UTC hours - 24/7 crypto market)
+# For $10-$100 growth phase: Trade aggressively during high-volume periods
 SESSIONS = {
-    "london":    {"start": 8,  "end": 10, "weight": 1.0},  # 3:00-5:00 ET = 8:00-10:00 UTC
-    "ny_am":     {"start": 14, "end": 16, "weight": 1.0},  # 9:30-11:30 ET = 14:30-16:30 UTC
-    "lunch":     {"start": 17, "end": 19, "weight": 0.0},  # 12:00-14:00 ET = 17:00-19:00 UTC (AVOID)
+    "asia":      {"start": 0,  "end": 8,  "weight": 0.8},  # Asian session (lower volume)
+    "london":    {"start": 8,  "end": 16, "weight": 1.0},  # London + overlap (best volume)
+    "ny":        {"start": 16, "end": 21, "weight": 1.0},  # NY session (best volume)
+    "evening":   {"start": 21, "end": 24, "weight": 0.8},  # Evening (lower volume)
 }
 
 # Setup types
@@ -195,6 +197,19 @@ class FlowHunterV2(ScriptStrategyBase):
         self.tier2_filled = False  # 25% at swing level
         self.tier3_active = True   # 25% with delta exit
 
+        # ── Order ID Tracking (CRITICAL for order management) ──
+        self.entry_order_id: Optional[str] = None
+        self.sl_order_id: Optional[str] = None
+        self.tp1_order_id: Optional[str] = None
+        self.tp2_order_id: Optional[str] = None
+
+        # ── Order Validation State ──
+        self.pending_entry_validation = False
+        self.entry_validation_time = 0
+
+        # ── Error Tracking (for better logging) ──
+        self.failed_order_errors: Dict[str, str] = {}  # order_id -> error_message
+
         # ── Session Tracking ──
         self.session_trades = 0
         self.session_losses = 0
@@ -217,6 +232,22 @@ class FlowHunterV2(ScriptStrategyBase):
         # ── Logging ──
         self.startup_logged = False
         self.last_log_time = 0
+
+        # ── Compression Detection ──
+        self.bb_squeeze = False  # Bollinger Band squeeze active
+        self.atr_compression = False  # ATR contraction active
+        self.compression_active = False  # Combined compression signal
+        self.bb_width = 0.0  # Current BB width percentage
+        self.atr_value = 0.0  # Current ATR value
+        self.atr_percentile = 0.0  # ATR percentile (0-100)
+
+        # ── Funding Rate Bias ──
+        self.funding_rate = Decimal("0")  # Current funding rate
+        self.funding_bias = 0  # 1=LONG bias, -1=SHORT bias, 0=neutral
+        self.last_funding_update = 0  # Timestamp of last funding update
+
+        # ── Liquidation Levels ──
+        self.liquidation_clusters: List[dict] = []  # {price, side, strength}
 
     @property
     def candles_ready(self):
@@ -252,6 +283,25 @@ class FlowHunterV2(ScriptStrategyBase):
         # Check session
         self._update_session()
 
+        # ALWAYS run big picture analysis (even when not trading)
+        # This ensures we always have key levels and liquidity pools identified
+        self._analyze_big_picture()
+
+        # Run advanced analysis functions
+        self._detect_compression()
+        self._update_funding_rate()
+        self._detect_liquidation_clusters()
+
+        # Check for orphaned positions (positions without SL/TP protection)
+        # This happens after bot restarts with existing positions
+        if not hasattr(self, '_orphan_check_done'):
+            self._check_and_protect_orphaned_position()
+            self._orphan_check_done = True
+
+        # CRITICAL: Validate orders exist after entry (runs once after entry fills)
+        if self.pending_entry_validation:
+            self._validate_orders_exist()
+
         # Exit-first: manage existing position
         if self.position_side is not None:
             self._manage_position()
@@ -266,16 +316,149 @@ class FlowHunterV2(ScriptStrategyBase):
         if not self._can_trade():
             return
 
-        # Run big picture analysis (1H)
-        self._analyze_big_picture()
-
         # Run setup detection (5m footprint)
         signal = self._detect_setups()
         if signal == 0:
             return
 
+        # Apply trend filter (block counter-trend trades)
+        signal = self._apply_trend_filter(signal)
+        if signal == 0:
+            return
+
         # Execute entry
         self._execute_entry(signal)
+
+    # ═══════════════════════════════════════════════════════════════
+    # ORDER EVENT CALLBACKS (CRITICAL for state management)
+    # ═══════════════════════════════════════════════════════════════
+
+    def did_fill_order(self, event):
+        """
+        Called when an order fills. This is where we update position state.
+        NEVER update state before this callback - that's an anti-pattern!
+        """
+        try:
+            # Only process our trading pair
+            if event.trading_pair != self.PAIR:
+                return
+
+            order_id = event.order_id
+            trade_type = event.trade_type
+            order_type = event.order_type
+            price = event.price
+            amount = event.amount
+
+            self.logger().info(
+                f"[FH2] 📥 Order filled: {order_id[:8]}... | "
+                f"Type: {trade_type.name} {order_type.name} | "
+                f"Price: ${price:,.2f} | Amount: {amount:.6f} BTC"
+            )
+
+            # Entry order filled - UPDATE STATE HERE (not in _execute_entry!)
+            if order_id == self.entry_order_id:
+                self.position_side = 1 if trade_type.name == "BUY" else -1
+                self.entry_price = Decimal(str(price))
+                self.position_size = Decimal(str(amount))
+                self.entry_time = time.time()
+                self.position_state = STATE_LONG if self.position_side == 1 else STATE_SHORT
+
+                direction = "LONG" if self.position_side == 1 else "SHORT"
+                self.logger().info(
+                    f"[FH2] ✅ {direction} POSITION OPENED | "
+                    f"Entry: ${price:,.2f} | Size: {amount:.6f} BTC | "
+                    f"Setup: {self.setup_type}"
+                )
+
+                # Now validate that SL/TP orders exist
+                self.pending_entry_validation = True
+                self.entry_validation_time = time.time()
+
+            # SL order filled
+            elif order_id == self.sl_order_id:
+                self.logger().warning(
+                    f"[FH2] 🛑 STOP LOSS HIT @ ${price:,.2f} | "
+                    f"Loss: ${(price - float(self.entry_price)) * float(amount):,.2f}"
+                )
+                self._finalize_close()
+
+            # TP1 order filled (50%)
+            elif order_id == self.tp1_order_id:
+                self.tier1_filled = True
+                profit = (price - float(self.entry_price)) * float(amount) if self.position_side == 1 else (float(self.entry_price) - price) * float(amount)
+                self.logger().info(
+                    f"[FH2] 🎯 TP1 HIT (50%) @ ${price:,.2f} | "
+                    f"Profit: ${profit:,.2f}"
+                )
+
+            # TP2 order filled (25%)
+            elif order_id == self.tp2_order_id:
+                self.tier2_filled = True
+                profit = (price - float(self.entry_price)) * float(amount) if self.position_side == 1 else (float(self.entry_price) - price) * float(amount)
+                self.logger().info(
+                    f"[FH2] 🎯 TP2 HIT (25%) @ ${price:,.2f} | "
+                    f"Profit: ${profit:,.2f}"
+                )
+
+        except Exception as e:
+            self.logger().error(f"[FH2] ❌ Error in did_fill_order: {e}", exc_info=True)
+
+    def did_fail_order(self, event):
+        """
+        Called when an order fails. CRITICAL for detecting SL/TP failures.
+        Note: MarketOrderFailureEvent only has: timestamp, order_id, order_type, error_message, error_type
+        """
+        try:
+            order_id = event.order_id
+            order_type = event.order_type
+            error_msg = event.error_message if hasattr(event, 'error_message') and event.error_message else None
+
+            # Store error message if this is the first failure for this order
+            if error_msg and order_id not in self.failed_order_errors:
+                self.failed_order_errors[order_id] = error_msg
+
+            # Get error message (use stored if current is None - happens on re-triggered failures)
+            display_error = error_msg or self.failed_order_errors.get(order_id, 'Unknown')
+
+            # Only process if this is one of our tracked orders
+            tracked_orders = [self.entry_order_id, self.sl_order_id, self.tp1_order_id, self.tp2_order_id]
+            if order_id not in tracked_orders:
+                # This is an old/unrelated order - log at debug level only
+                self.logger().debug(
+                    f"[FH2] 🔍 Ignoring failure for untracked order: {order_id[:8]}... | "
+                    f"Reason: {display_error}"
+                )
+                return
+
+            # Log the failure
+            self.logger().error(
+                f"[FH2] ❌ ORDER FAILED: {order_id[:8]}... | "
+                f"Type: {order_type.name} | "
+                f"Reason: {display_error}"
+            )
+
+            # Entry order failed - clear state
+            if order_id == self.entry_order_id:
+                self.logger().error(f"[FH2] 🚨 ENTRY ORDER FAILED - Aborting trade")
+                self._reset_position_state()
+                return
+
+            # SL order failed - EMERGENCY CLOSE POSITION
+            if order_id == self.sl_order_id:
+                self.logger().error(
+                    f"[FH2] 🚨🚨🚨 STOP LOSS ORDER FAILED - CLOSING POSITION IMMEDIATELY"
+                )
+                self._emergency_close_position()
+                return
+
+            # TP order failed - log but continue (not critical)
+            if order_id in [self.tp1_order_id, self.tp2_order_id]:
+                self.logger().warning(
+                    f"[FH2] ⚠️ TP order failed - will manage manually"
+                )
+
+        except Exception as e:
+            self.logger().error(f"[FH2] ❌ Error in did_fail_order: {e}", exc_info=True)
 
     # ═══════════════════════════════════════════════════════════════
     # LEVERAGE MANAGEMENT
@@ -322,12 +505,9 @@ class FlowHunterV2(ScriptStrategyBase):
         if self.session_trades >= self.max_trades_per_session:
             return False
 
-        # Avoid lunch hour
-        if self.current_session == "lunch":
-            return False
-
-        # Only trade during best windows
-        if self.current_session not in ["london", "ny_am"]:
+        # Trade during all sessions (24/7 for $10-$100 growth phase)
+        # Session weight is used for position sizing, not filtering
+        if self.current_session == "unknown":
             return False
 
         return True
@@ -582,6 +762,35 @@ class FlowHunterV2(ScriptStrategyBase):
             return signal
 
         return 0
+
+    def _apply_trend_filter(self, signal: int) -> int:
+        """
+        Apply trend filter to entry signals.
+        Block counter-trend trades unless reversal is detected.
+
+        Args:
+            signal: Entry signal (1=LONG, -1=SHORT, 0=none)
+
+        Returns:
+            Filtered signal (0 if blocked)
+        """
+        if self.trend == 0:
+            # No clear trend - allow all trades
+            return signal
+
+        # Block counter-trend trades
+        if signal == 1 and self.trend == -1:  # LONG in BEAR
+            self.logger().info(f"[FH2] ❌ LONG signal blocked - BEAR trend detected")
+            return 0
+        if signal == -1 and self.trend == 1:  # SHORT in BULL
+            self.logger().info(f"[FH2] ❌ SHORT signal blocked - BULL trend detected")
+            return 0
+
+        # Signal aligns with trend
+        trend_name = "BULL" if self.trend == 1 else "BEAR"
+        direction = "LONG" if signal == 1 else "SHORT"
+        self.logger().info(f"[FH2] ✅ {direction} signal approved - {trend_name} trend alignment")
+        return signal
 
     def _find_nearest_key_level(self, price: float) -> Optional[dict]:
         """
@@ -850,17 +1059,19 @@ class FlowHunterV2(ScriptStrategyBase):
         Goal: Maximize learning and growth from $10 to $100
 
         With 10x leverage:
-        - $10 balance = $100 buying power
-        - Position size = $100 / price
+        - $15.81 balance = $158.10 buying power
+        - Position size = $158.10 / price
 
         This is high risk but optimal for:
         1. Rapid capital growth in small account phase
         2. Maximum trade journal data collection
         3. Learning from real P&L impact
+
+        Safety: Ensures minimum $10 order value for Hyperliquid
         """
         balance = self._get_balance()
         if balance is None or balance <= 0:
-            self.logger().warning(f"[FH2] No balance available")
+            self.logger().warning(f"[FH2] ⚠️ No balance available (balance={balance})")
             return Decimal("0")
 
         # Use 100% of balance with leverage
@@ -870,11 +1081,23 @@ class FlowHunterV2(ScriptStrategyBase):
         # Position size in BTC = buying_power / price
         position_size = buying_power / Decimal(str(price))
 
+        # Calculate position value in USD
+        position_value = position_size * Decimal(str(price))
+
+        # Hyperliquid minimum order value is $10
+        # If position is too small, we can't trade
+        if position_value < Decimal("10.0"):
+            self.logger().warning(
+                f"[FH2] ⚠️ Position too small: ${float(position_value):.2f} < $10 minimum | "
+                f"Need balance ≥ ${10.0 / self.leverage:.2f} to trade"
+            )
+            return Decimal("0")
+
         # Log the aggressive sizing
         self.logger().info(
             f"[FH2] 💰 AGGRESSIVE SIZING: balance=${float(balance):.2f} | "
             f"leverage={self.leverage}x | buying_power=${float(buying_power):.2f} | "
-            f"size={float(position_size):.6f} BTC (${float(position_size * Decimal(str(price))):.2f})"
+            f"size={float(position_size):.6f} BTC (${float(position_value):.2f}) ✅"
         )
 
         return position_size
@@ -891,11 +1114,214 @@ class FlowHunterV2(ScriptStrategyBase):
         return None
 
     # ═══════════════════════════════════════════════════════════════
+    # COMPRESSION DETECTION
+    # ═══════════════════════════════════════════════════════════════
+
+    def _detect_compression(self):
+        """
+        Detect volatility compression using:
+        1. Bollinger Band Squeeze - bands narrowing (low BB width)
+        2. ATR Contraction - ATR below 20th percentile
+
+        Compression often precedes explosive moves.
+        """
+        try:
+            df = self.btc_5m_candles.candles_df.copy()
+            if len(df) < 100:
+                return
+
+            # Calculate Bollinger Bands manually
+            bb_length = 20
+            bb_std = 2.0
+
+            # Calculate SMA (middle band)
+            bb_middle = df['close'].rolling(window=bb_length).mean()
+
+            # Calculate standard deviation
+            bb_std_dev = df['close'].rolling(window=bb_length).std()
+
+            # Calculate upper and lower bands
+            bb_upper = bb_middle + (bb_std * bb_std_dev)
+            bb_lower = bb_middle - (bb_std * bb_std_dev)
+
+            # Calculate BB width percentage (bandwidth / middle band)
+            bb_width = ((bb_upper - bb_lower) / bb_middle) * 100
+            self.bb_width = float(bb_width.iloc[-1])
+
+            # BB Squeeze: width in lowest 20th percentile of last 100 candles
+            bb_width_percentile = (bb_width.iloc[-1] <= bb_width.rolling(100).quantile(0.20).iloc[-1])
+            self.bb_squeeze = bb_width_percentile
+
+            # Calculate ATR manually
+            atr_length = 14
+            high_low = df['high'] - df['low']
+            high_close = np.abs(df['high'] - df['close'].shift())
+            low_close = np.abs(df['low'] - df['close'].shift())
+
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = true_range.rolling(window=atr_length).mean()
+
+            self.atr_value = float(atr.iloc[-1])
+
+            # ATR Contraction: ATR in lowest 20th percentile
+            atr_percentile_value = atr.rolling(100).rank(pct=True).iloc[-1]
+            self.atr_percentile = float(atr_percentile_value * 100)
+            self.atr_compression = (atr_percentile_value <= 0.20)
+
+            # Combined compression signal
+            self.compression_active = self.bb_squeeze and self.atr_compression
+
+        except Exception as e:
+            self.logger().error(f"[FH2] Compression detection error: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # FUNDING RATE BIAS
+    # ═══════════════════════════════════════════════════════════════
+
+    def _update_funding_rate(self):
+        """
+        Get current funding rate from connector and determine bias.
+
+        Funding Rate Logic:
+        - Negative funding = Shorts pay Longs → LONG bias (shorts overleveraged)
+        - Positive funding = Longs pay Shorts → SHORT bias (longs overleveraged)
+        - Near zero = Neutral
+
+        Funding updates every 1 hour on Hyperliquid.
+        """
+        try:
+            # Only update every 5 minutes to avoid rate limits
+            now = time.time()
+            if now - self.last_funding_update < 300:  # 5 minutes
+                return
+
+            connector = self.connectors.get(self.EXCHANGE)
+            if not connector:
+                return
+
+            # Get funding info from connector
+            funding_info = connector.get_funding_info(self.PAIR)
+            if funding_info:
+                # Funding rate might be in different formats
+                # Try to normalize it to decimal form (e.g., 0.0001 = 0.01%)
+                raw_rate = funding_info.rate
+
+                # If rate is already very small (< 1), it's in decimal form
+                # If rate is large (> 1), it might be in basis points or percentage
+                if isinstance(raw_rate, Decimal):
+                    rate_float = float(raw_rate)
+                else:
+                    rate_float = float(raw_rate) if raw_rate else 0.0
+
+                # Normalize: if rate > 1, assume it's in basis points (divide by 1,000,000)
+                if abs(rate_float) > 1:
+                    self.funding_rate = Decimal(str(rate_float / 1000000))
+                else:
+                    self.funding_rate = Decimal(str(rate_float))
+
+                self.last_funding_update = now
+
+                # Determine bias
+                # Threshold: ±0.01% (0.0001 in decimal form) is considered neutral
+                if self.funding_rate < Decimal("-0.0001"):
+                    self.funding_bias = 1  # LONG bias (shorts paying)
+                elif self.funding_rate > Decimal("0.0001"):
+                    self.funding_bias = -1  # SHORT bias (longs paying)
+                else:
+                    self.funding_bias = 0  # Neutral
+
+        except Exception as e:
+            self.logger().error(f"[FH2] Funding rate update error: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # LIQUIDATION LEVEL DETECTION
+    # ═══════════════════════════════════════════════════════════════
+
+    def _detect_liquidation_clusters(self):
+        """
+        Estimate liquidation clusters based on recent price action.
+
+        Since Hyperliquid doesn't expose liquidation data directly,
+        we estimate clusters by:
+        1. Finding recent swing highs/lows (likely entry points)
+        2. Calculating liquidation prices assuming 10x leverage
+        3. Clustering nearby liquidation levels
+
+        Liquidation clusters act as price magnets.
+        """
+        try:
+            df = self.btc_1h_candles.candles_df.copy()
+            if len(df) < 50:
+                return
+
+            self.liquidation_clusters = []
+            current_price = float(df.iloc[-1]['close'])
+
+            # Find swing highs and lows (potential entry points)
+            swing_window = 5
+            swings = []
+
+            for i in range(swing_window, len(df) - swing_window):
+                # Swing high
+                if df.iloc[i]['high'] == df.iloc[i-swing_window:i+swing_window+1]['high'].max():
+                    swings.append({
+                        'price': float(df.iloc[i]['high']),
+                        'type': 'high',
+                        'timestamp': df.iloc[i]['timestamp']
+                    })
+                # Swing low
+                if df.iloc[i]['low'] == df.iloc[i-swing_window:i+swing_window+1]['low'].min():
+                    swings.append({
+                        'price': float(df.iloc[i]['low']),
+                        'type': 'low',
+                        'timestamp': df.iloc[i]['timestamp']
+                    })
+
+            # Calculate liquidation levels (assuming 10x leverage, 90% liquidation threshold)
+            for swing in swings[-20:]:  # Last 20 swings
+                if swing['type'] == 'high':
+                    # LONG entries at swing high → liquidation below
+                    liq_price = swing['price'] * 0.91  # 9% drop liquidates 10x long
+                    side = 'LONG'
+                else:
+                    # SHORT entries at swing low → liquidation above
+                    liq_price = swing['price'] * 1.09  # 9% rise liquidates 10x short
+                    side = 'SHORT'
+
+                # Only track liquidations within ±5% of current price
+                distance_pct = abs(liq_price - current_price) / current_price
+                if distance_pct < 0.05:
+                    self.liquidation_clusters.append({
+                        'price': liq_price,
+                        'side': side,
+                        'strength': 1.0,
+                        'distance_pct': distance_pct
+                    })
+
+            # Cluster nearby liquidations (within 0.2%)
+            clustered = []
+            for liq in sorted(self.liquidation_clusters, key=lambda x: x['price']):
+                if not clustered:
+                    clustered.append(liq)
+                else:
+                    last = clustered[-1]
+                    if abs(liq['price'] - last['price']) / last['price'] < 0.002:
+                        # Merge into cluster
+                        last['strength'] += 1.0
+                    else:
+                        clustered.append(liq)
+
+            self.liquidation_clusters = clustered
+
+        except Exception as e:
+            self.logger().error(f"[FH2] Liquidation detection error: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
     # EXECUTION
     # ═══════════════════════════════════════════════════════════════
 
     def _execute_entry(self, signal: int):
-        """Execute entry order."""
+        """Execute entry order with exchange-side SL/TP protection."""
         try:
             df_5m = self.btc_5m_candles.candles_df.copy()
             price = float(df_5m.iloc[-1]['close'])
@@ -910,55 +1336,171 @@ class FlowHunterV2(ScriptStrategyBase):
                 self.logger().warning(f"[FH2] Position size too small: {position_size}")
                 return
 
-            # Place order
-            connector = self.connectors.get(self.EXCHANGE)
-            if not connector:
-                return
+            # Calculate TP targets
+            tier1_target, tier2_target = self._calculate_tp_targets(price, stop_price, signal)
+
+            # Get connector - must use the actual connector instance, not self
+            connector = self.connectors[self.EXCHANGE]
 
             direction = "LONG" if signal == 1 else "SHORT"
 
-            # Market order - LONG uses buy(), SHORT uses sell()
-            if signal == 1:  # LONG
-                self.buy(
-                    connector_name=self.EXCHANGE,
-                    trading_pair=self.PAIR,
-                    amount=position_size,
-                    order_type=OrderType.MARKET,
-                    position_action=PositionAction.OPEN
-                )
-            else:  # SHORT
-                self.sell(
-                    connector_name=self.EXCHANGE,
-                    trading_pair=self.PAIR,
-                    amount=position_size,
-                    order_type=OrderType.MARKET,
-                    position_action=PositionAction.OPEN
-                )
+            self.logger().info(f"[FH2] 📝 Placing {direction} entry orders...")
 
-            # Update state
-            self.position_side = signal
-            self.entry_price = Decimal(str(price))
-            self.entry_time = time.time()
-            self.position_size = position_size
-            self.stop_price = Decimal(str(stop_price))
-            self.position_state = STATE_LONG if signal == 1 else STATE_SHORT
+            # 1. Place market entry order - LONG uses buy(), SHORT uses sell()
+            try:
+                if signal == 1:  # LONG
+                    entry_order_id = self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=position_size,
+                        order_type=OrderType.MARKET,
+                        position_action=PositionAction.OPEN
+                    )
+                    self.logger().info(f"[FH2] ✅ Entry BUY order placed: {entry_order_id}")
+                else:  # SHORT
+                    entry_order_id = self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=position_size,
+                        order_type=OrderType.MARKET,
+                        position_action=PositionAction.OPEN
+                    )
+                    self.logger().info(f"[FH2] ✅ Entry SELL order placed: {entry_order_id}")
 
-            # Reset tier tracking
+                # CRITICAL: Store entry order ID for tracking
+                self.entry_order_id = entry_order_id
+
+            except Exception as e:
+                self.logger().error(f"[FH2] ❌ Entry order failed: {e}")
+                return
+
+            # 2. Place stop loss trigger order (CRITICAL - protects against bot crashes)
+            # Use self.buy()/sell() with connector_name to pass trigger parameter through **kwargs
+            # LONG needs SELL stop, SHORT needs BUY stop
+            try:
+                if signal == 1:  # LONG - place sell stop loss
+                    sl_order_id = self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=position_size,
+                        order_type=OrderType.LIMIT,  # Trigger orders use LIMIT type
+                        price=Decimal(str(stop_price)),
+                        position_action=PositionAction.CLOSE,
+                        trigger={"triggerPx": float(stop_price), "tpsl": "sl", "isMarket": True}
+                    )
+                    self.logger().info(f"[FH2] ✅ SL trigger order placed: {sl_order_id} @ ${stop_price:.2f}")
+                else:  # SHORT - place buy stop loss
+                    sl_order_id = self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=position_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(stop_price)),
+                        position_action=PositionAction.CLOSE,
+                        trigger={"triggerPx": float(stop_price), "tpsl": "sl", "isMarket": True}
+                    )
+                    self.logger().info(f"[FH2] ✅ SL trigger order placed: {sl_order_id} @ ${stop_price:.2f}")
+
+                # CRITICAL: Store SL order ID for tracking
+                self.sl_order_id = sl_order_id
+                self.stop_price = Decimal(str(stop_price))
+
+            except Exception as e:
+                self.logger().error(f"[FH2] ❌ CRITICAL: SL order failed: {e}")
+                self.logger().error(f"[FH2] ⚠️ Position is UNPROTECTED - manual intervention required!")
+                # TODO: Close position immediately if SL fails
+                return
+
+            # 3. Place Tier 1 TP limit order (50% at POC/target)
+            tier1_size = position_size * Decimal("0.5")
+            try:
+                if signal == 1:  # LONG - place sell limit at target
+                    tp1_order_id = self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier1_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier1_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+                    self.logger().info(f"[FH2] ✅ TP1 order placed: {tp1_order_id} @ ${tier1_target:.2f} (50%)")
+                else:  # SHORT - place buy limit at target
+                    tp1_order_id = self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier1_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier1_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+                    self.logger().info(f"[FH2] ✅ TP1 order placed: {tp1_order_id} @ ${tier1_target:.2f} (50%)")
+
+                # CRITICAL: Store TP1 order ID for tracking
+                self.tp1_order_id = tp1_order_id
+
+            except Exception as e:
+                self.logger().error(f"[FH2] ❌ TP1 order failed: {e}")
+
+            # 4. Place Tier 2 TP limit order (25% at swing level)
+            tier2_size = position_size * Decimal("0.25")
+            try:
+                if signal == 1:  # LONG - place sell limit at swing
+                    tp2_order_id = self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier2_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier2_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+                    self.logger().info(f"[FH2] ✅ TP2 order placed: {tp2_order_id} @ ${tier2_target:.2f} (25%)")
+                else:  # SHORT - place buy limit at swing
+                    tp2_order_id = self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier2_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier2_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+                    self.logger().info(f"[FH2] ✅ TP2 order placed: {tp2_order_id} @ ${tier2_target:.2f} (25%)")
+
+                # CRITICAL: Store TP2 order ID for tracking
+                self.tp2_order_id = tp2_order_id
+
+            except Exception as e:
+                self.logger().error(f"[FH2] ❌ TP2 order failed: {e}")
+
+            # ═══════════════════════════════════════════════════════════════
+            # CRITICAL: DO NOT UPDATE STATE HERE!
+            # State will be updated in did_fill_order() callback when entry fills
+            # This prevents "eventually consistent" state issues
+            # ═══════════════════════════════════════════════════════════════
+
+            # Store setup info for logging when entry fills
+            self.setup_type = self.setup_type  # Already set in _detect_setups()
+
+            # Reset tier tracking (safe to do here - not position state)
             self.tier1_filled = False
             self.tier2_filled = False
             self.tier3_active = True
 
-            # Update session counters
+            # Update session counters (safe to do here)
             self.session_trades += 1
 
-            # Log entry
+            # Log order placement summary
             confirmations_str = ", ".join(self.confirmations)
             self.logger().info(
-                f"[FH2] 🎯 ENTRY {direction} @ {price:.0f} | "
+                f"[FH2] 📋 ORDERS PLACED for {direction} @ {price:.0f} | "
                 f"size={float(position_size):.6f} BTC | "
-                f"stop={float(stop_price):.0f} | "
+                f"SL={float(stop_price):.0f} (exchange) | "
+                f"TP1={float(tier1_target):.0f} (50%) | "
+                f"TP2={float(tier2_target):.0f} (25%) | "
                 f"setup={self.setup_type} | "
                 f"confirmations={len(self.confirmations)} ({confirmations_str})"
+            )
+            self.logger().info(
+                f"[FH2] ⏳ Waiting for entry fill confirmation..."
             )
 
         except Exception as e:
@@ -985,16 +1527,41 @@ class FlowHunterV2(ScriptStrategyBase):
         else:
             return entry * 1.01
 
+    def _calculate_tp_targets(self, entry: float, stop: float, side: int) -> tuple:
+        """
+        Calculate take profit targets for Tier 1 and Tier 2.
+
+        Tier 1: 1.5x risk (50% exit)
+        Tier 2: 3x risk (25% exit)
+        Tier 3: Dynamic delta exit (25% remaining)
+
+        Returns: (tier1_target, tier2_target)
+        """
+        risk = abs(entry - stop)
+
+        if side == 1:  # LONG
+            tier1_target = entry + (risk * 1.5)  # 1.5R
+            tier2_target = entry + (risk * 3.0)  # 3R
+        else:  # SHORT
+            tier1_target = entry - (risk * 1.5)  # 1.5R
+            tier2_target = entry - (risk * 3.0)  # 3R
+
+        return (tier1_target, tier2_target)
+
     # ═══════════════════════════════════════════════════════════════
     # POSITION MANAGEMENT (TIERED EXITS)
     # ═══════════════════════════════════════════════════════════════
 
     def _manage_position(self):
         """
-        Manage open position with tiered exits:
-        - 50% at nearest POC or heavy volume node
-        - 25% at next swing level or 2x ATR
-        - 25% hold until delta exit signal
+        Manage open position with exchange-side TP/SL orders:
+        - SL: Exchange trigger order (automatic)
+        - Tier 1 (50%): Exchange limit order at 1.5R (automatic)
+        - Tier 2 (25%): Exchange limit order at 3R (automatic)
+        - Tier 3 (25%): Dynamic delta exit (manual - this function)
+
+        This function now only manages Tier 3 (25%) with delta exit signal.
+        The exchange handles SL and Tier 1/2 automatically.
         """
         try:
             df_5m = self.btc_5m_candles.candles_df.copy()
@@ -1003,28 +1570,49 @@ class FlowHunterV2(ScriptStrategyBase):
 
             current_price = Decimal(str(df_5m.iloc[-1]['close']))
 
-            # Check stop loss first
-            if self._check_stop_loss(current_price):
+            # Get current position size from exchange
+            connector = self.connectors.get(self.EXCHANGE)
+            if not connector:
                 return
 
-            # Tier 1: 50% at nearest POC
-            if not self.tier1_filled:
-                if self._check_tier1_exit(current_price):
-                    self._execute_partial_exit(0.5, "Tier1_POC", current_price)
-                    self.tier1_filled = True
-                    return
+            # Check actual position size on exchange using account_positions property
+            positions = connector.account_positions
+            position = None
+            for pos_key, pos in positions.items():
+                if pos.trading_pair == self.PAIR:
+                    position = pos
+                    break
 
-            # Tier 2: 25% at swing level
-            if self.tier1_filled and not self.tier2_filled:
-                if self._check_tier2_exit(current_price):
-                    self._execute_partial_exit(0.25, "Tier2_Swing", current_price)
-                    self.tier2_filled = True
-                    return
+            if position is None or position.amount == 0:
+                # Position fully closed (SL hit or all TPs filled)
+                self.logger().info(f"[FH2] Position fully closed by exchange orders")
+                self._finalize_close()
+                return
 
-            # Tier 3: 25% with delta exit signal
+            current_position_size = abs(float(position.amount))
+            original_size = float(self.position_size)
+
+            # Detect Tier 1 fill (position reduced to ~50%)
+            if not self.tier1_filled and current_position_size <= original_size * 0.55:
+                self.tier1_filled = True
+                self.logger().info(
+                    f"[FH2] ✅ Tier 1 FILLED (50%) @ TP1 | "
+                    f"Remaining: {current_position_size:.6f} BTC"
+                )
+
+            # Detect Tier 2 fill (position reduced to ~25%)
+            if self.tier1_filled and not self.tier2_filled and current_position_size <= original_size * 0.30:
+                self.tier2_filled = True
+                self.logger().info(
+                    f"[FH2] ✅ Tier 2 FILLED (25%) @ TP2 | "
+                    f"Remaining: {current_position_size:.6f} BTC"
+                )
+
+            # Tier 3: Manual delta exit for remaining 25%
             if self.tier1_filled and self.tier2_filled and self.tier3_active:
                 if self._check_delta_exit_signal():
-                    self._execute_partial_exit(0.25, "Tier3_Delta", current_price)
+                    # Close remaining position manually
+                    self._execute_partial_exit(1.0, "Tier3_Delta", current_price)  # 100% of remaining
                     self.tier3_active = False
                     self._finalize_close()
                     return
@@ -1032,49 +1620,167 @@ class FlowHunterV2(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"[FH2] Position management error: {e}")
 
-    def _check_stop_loss(self, current_price: Decimal) -> bool:
-        """Check if stop loss hit."""
-        if self.position_side == 1:  # LONG
-            if current_price <= self.stop_price:
-                self._close_full_position("SL", current_price)
-                return True
-        else:  # SHORT
-            if current_price >= self.stop_price:
-                self._close_full_position("SL", current_price)
-                return True
-        return False
+    def _check_and_protect_orphaned_position(self):
+        """
+        Check for orphaned positions (positions without SL/TP protection).
+        This happens when bot restarts with an existing position that was
+        entered with old code before SL/TP implementation.
 
-    def _check_tier1_exit(self, current_price: Decimal) -> bool:
-        """Check if we should take Tier 1 exit (50% at POC)."""
-        # Get current POC
-        poc = self.footprint.get_poc("5m")
-        if not poc:
-            return False
+        If found, add SL/TP orders to protect the position.
+        """
+        try:
+            connector = self.connectors.get(self.EXCHANGE)
+            if not connector:
+                return
 
-        # Check if price reached POC
-        distance = abs(float(current_price) - poc) / float(current_price)
+            # Check if position exists on exchange using account_positions property
+            positions = connector.account_positions
+            if not positions:
+                self.logger().info(f"[FH2] No orphaned position found - starting fresh")
+                return
 
-        if self.position_side == 1:  # LONG
-            # POC should be above entry
-            if poc > float(self.entry_price) and distance < 0.002:  # Within 0.2%
-                return True
-        else:  # SHORT
-            # POC should be below entry
-            if poc < float(self.entry_price) and distance < 0.002:
-                return True
+            # Find position for our trading pair
+            position = None
+            for pos_key, pos in positions.items():
+                if pos.trading_pair == self.PAIR:
+                    position = pos
+                    break
 
-        return False
+            if position is None or position.amount == 0:
+                self.logger().info(f"[FH2] No orphaned position found - starting fresh")
+                return
 
-    def _check_tier2_exit(self, current_price: Decimal) -> bool:
-        """Check if we should take Tier 2 exit (25% at swing level)."""
-        # Simplified: check if we're up 2x the stop distance
-        entry_to_stop = abs(float(self.entry_price) - float(self.stop_price))
-        entry_to_current = abs(float(current_price) - float(self.entry_price))
+            # Position exists - check if we have internal state
+            if self.position_side is None:
+                # We have a position on exchange but no internal state
+                # This is an orphaned position from previous session
+                self.logger().warning(
+                    f"[FH2] ⚠️ ORPHANED POSITION DETECTED: "
+                    f"{abs(float(position.amount)):.6f} BTC @ ${float(position.entry_price):.2f}"
+                )
 
-        if entry_to_current >= entry_to_stop * 2:
-            return True
+                # Determine side
+                side = 1 if float(position.amount) > 0 else -1
 
-        return False
+                # Get current price
+                df_5m = self.btc_5m_candles.candles_df.copy()
+                if df_5m.empty:
+                    return
+                current_price = float(df_5m.iloc[-1]['close'])
+                entry_price = float(position.entry_price)
+
+                # Calculate stop loss (use 2% risk as default)
+                risk_pct = 0.02
+                if side == 1:  # LONG
+                    stop_price = entry_price * (1 - risk_pct)
+                else:  # SHORT
+                    stop_price = entry_price * (1 + risk_pct)
+
+                # Calculate TP targets
+                tier1_target, tier2_target = self._calculate_tp_targets(entry_price, stop_price, side)
+
+                position_size = abs(float(position.amount))
+
+                # Check if position is in profit
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100 * side
+
+                self.logger().info(
+                    f"[FH2] Adding protection to orphaned position | "
+                    f"PnL: {pnl_pct:+.2f}% | "
+                    f"SL: ${stop_price:.2f} | "
+                    f"TP1: ${tier1_target:.2f} | "
+                    f"TP2: ${tier2_target:.2f}"
+                )
+
+                # Place SL trigger order for full position
+                if side == 1:  # LONG - place sell stop loss
+                    self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=Decimal(str(position_size)),
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(stop_price)),
+                        position_action=PositionAction.CLOSE,
+                        trigger={"triggerPx": float(stop_price), "tpsl": "sl", "isMarket": True}
+                    )
+                else:  # SHORT - place buy stop loss
+                    self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=Decimal(str(position_size)),
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(stop_price)),
+                        position_action=PositionAction.CLOSE,
+                        trigger={"triggerPx": float(stop_price), "tpsl": "sl", "isMarket": True}
+                    )
+
+                # Estimate remaining tiers (assume 50% already exited if position is small)
+                # For simplicity, place TP orders for current position size
+                tier1_size = Decimal(str(position_size * 0.5))
+                tier2_size = Decimal(str(position_size * 0.25))
+
+                # Place Tier 1 TP limit order
+                if side == 1:  # LONG
+                    self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier1_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier1_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+                else:  # SHORT
+                    self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier1_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier1_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+
+                # Place Tier 2 TP limit order
+                if side == 1:  # LONG
+                    self.sell(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier2_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier2_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+                else:  # SHORT
+                    self.buy(
+                        connector_name=self.EXCHANGE,
+                        trading_pair=self.PAIR,
+                        amount=tier2_size,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal(str(tier2_target)),
+                        position_action=PositionAction.CLOSE
+                    )
+
+                # Update internal state to match exchange
+                self.position_side = side
+                self.position_size = Decimal(str(position_size))
+                self.entry_price = Decimal(str(entry_price))
+                self.stop_price = Decimal(str(stop_price))
+                self.entry_time = time.time()  # Approximate
+
+                self.logger().info(
+                    f"[FH2] ✅ Orphaned position now protected with SL/TP orders | "
+                    f"Position synced to internal state"
+                )
+            else:
+                # We have both exchange position and internal state
+                # Check if SL/TP orders exist (query open orders)
+                # For now, assume if we have internal state, orders are already placed
+                self.logger().info(f"[FH2] Position already tracked - no orphan protection needed")
+
+        except Exception as e:
+            self.logger().error(f"[FH2] Orphaned position check error: {e}")
+
+    # NOTE: _check_stop_loss, _check_tier1_exit, _check_tier2_exit removed
+    # These are now handled automatically by exchange-side trigger/limit orders
 
     def _check_delta_exit_signal(self) -> bool:
         """
@@ -1232,7 +1938,22 @@ class FlowHunterV2(ScriptStrategyBase):
             self.logger().error(f"[FH2] Full exit error: {e}")
 
     def _finalize_close(self):
-        """Reset position state."""
+        """Reset position state and cancel remaining orders."""
+        # Cancel any remaining SL/TP orders
+        try:
+            if self.sl_order_id:
+                self.cancel(self.EXCHANGE, self.PAIR, self.sl_order_id)
+                self.logger().info(f"[FH2] 🗑️ Cancelled SL order: {self.sl_order_id[:8]}...")
+            if self.tp1_order_id:
+                self.cancel(self.EXCHANGE, self.PAIR, self.tp1_order_id)
+                self.logger().info(f"[FH2] 🗑️ Cancelled TP1 order: {self.tp1_order_id[:8]}...")
+            if self.tp2_order_id:
+                self.cancel(self.EXCHANGE, self.PAIR, self.tp2_order_id)
+                self.logger().info(f"[FH2] 🗑️ Cancelled TP2 order: {self.tp2_order_id[:8]}...")
+        except Exception as e:
+            self.logger().warning(f"[FH2] Error cancelling orders: {e}")
+
+        # Reset position state
         self.position_state = STATE_FLAT
         self.position_side = None
         self.entry_price = Decimal("0")
@@ -1244,6 +1965,153 @@ class FlowHunterV2(ScriptStrategyBase):
         self.tier2_filled = False
         self.tier3_active = True
         self.confirmations = []
+
+        # Reset order IDs
+        self.entry_order_id = None
+        self.sl_order_id = None
+        self.tp1_order_id = None
+        self.tp2_order_id = None
+        self.pending_entry_validation = False
+
+        # Clear error tracking for closed orders
+        self.failed_order_errors.clear()
+
+    def _reset_position_state(self):
+        """Reset position state without cancelling orders (for failed entries)."""
+        self.position_state = STATE_FLAT
+        self.position_side = None
+        self.entry_price = Decimal("0")
+        self.entry_time = 0
+        self.position_size = Decimal("0")
+        self.stop_price = Decimal("0")
+        self.setup_type = None
+        self.tier1_filled = False
+        self.tier2_filled = False
+        self.tier3_active = True
+        self.confirmations = []
+        self.entry_order_id = None
+        self.sl_order_id = None
+        self.tp1_order_id = None
+        self.tp2_order_id = None
+        self.pending_entry_validation = False
+
+        # Clear error tracking for failed orders
+        self.failed_order_errors.clear()
+
+    def _emergency_close_position(self):
+        """Emergency position close when SL order fails."""
+        try:
+            connector = self.connectors.get(self.EXCHANGE)
+            if not connector:
+                self.logger().error(f"[FH2] 🚨 Cannot close position - connector not found")
+                return
+
+            # Get current position
+            positions = connector.account_positions
+            position = None
+            for pos_key, pos in positions.items():
+                if pos.trading_pair == self.PAIR:
+                    position = pos
+                    break
+
+            if position is None or position.amount == 0:
+                self.logger().warning(f"[FH2] No position to close")
+                self._finalize_close()
+                return
+
+            # Close entire position with market order
+            amount = abs(float(position.amount))
+
+            if self.position_side == 1:  # LONG - sell to close
+                self.sell(
+                    connector_name=self.EXCHANGE,
+                    trading_pair=self.PAIR,
+                    amount=Decimal(str(amount)),
+                    order_type=OrderType.MARKET,
+                    price=Decimal("0"),  # Market order
+                    position_action=PositionAction.CLOSE
+                )
+                self.logger().info(f"[FH2] 🚨 EMERGENCY CLOSE: Sold {amount:.6f} BTC")
+            else:  # SHORT - buy to close
+                self.buy(
+                    connector_name=self.EXCHANGE,
+                    trading_pair=self.PAIR,
+                    amount=Decimal(str(amount)),
+                    order_type=OrderType.MARKET,
+                    price=Decimal("0"),  # Market order
+                    position_action=PositionAction.CLOSE
+                )
+                self.logger().info(f"[FH2] 🚨 EMERGENCY CLOSE: Bought {amount:.6f} BTC")
+
+            self._finalize_close()
+
+        except Exception as e:
+            self.logger().error(f"[FH2] 🚨 Emergency close failed: {e}", exc_info=True)
+
+    def _validate_orders_exist(self):
+        """
+        Validate that SL and TP orders actually exist on exchange.
+        Called after entry fills to ensure position is protected.
+        """
+        try:
+            # Only validate if we have a pending validation
+            if not self.pending_entry_validation:
+                return
+
+            # Wait at least 3 seconds after entry before validating
+            if time.time() - self.entry_validation_time < 3:
+                return
+
+            connector = self.connectors.get(self.EXCHANGE)
+            if not connector:
+                return
+
+            # Get open orders
+            open_orders = connector.get_open_orders(self.PAIR)
+
+            # Check for SL order (trigger order)
+            has_sl = False
+            has_tp1 = False
+            has_tp2 = False
+
+            for order in open_orders:
+                order_id = order.client_order_id
+
+                # Check if this is our SL order
+                if order_id == self.sl_order_id:
+                    has_sl = True
+                    self.logger().info(f"[FH2] ✅ SL order confirmed on exchange: {order_id[:8]}...")
+
+                # Check if this is our TP1 order
+                if order_id == self.tp1_order_id:
+                    has_tp1 = True
+                    self.logger().info(f"[FH2] ✅ TP1 order confirmed on exchange: {order_id[:8]}...")
+
+                # Check if this is our TP2 order
+                if order_id == self.tp2_order_id:
+                    has_tp2 = True
+                    self.logger().info(f"[FH2] ✅ TP2 order confirmed on exchange: {order_id[:8]}...")
+
+            # CRITICAL: If SL is missing, close position immediately
+            if not has_sl:
+                self.logger().error(
+                    f"[FH2] 🚨🚨🚨 SL ORDER MISSING FROM EXCHANGE - CLOSING POSITION IMMEDIATELY"
+                )
+                self._emergency_close_position()
+                return
+
+            # Warn if TP orders are missing (not critical)
+            if not has_tp1:
+                self.logger().warning(f"[FH2] ⚠️ TP1 order missing from exchange")
+            if not has_tp2:
+                self.logger().warning(f"[FH2] ⚠️ TP2 order missing from exchange")
+
+            # Validation complete
+            self.pending_entry_validation = False
+            self.logger().info(f"[FH2] ✅ Order validation complete - position is protected")
+
+        except Exception as e:
+            self.logger().error(f"[FH2] ❌ Order validation error: {e}", exc_info=True)
 
     # ═══════════════════════════════════════════════════════════════
     # LOGGING
@@ -1258,16 +2126,29 @@ class FlowHunterV2(ScriptStrategyBase):
             return
 
         price = float(df_5m.iloc[-1]['close'])
+        balance = self._get_balance()
+        balance_str = f"${float(balance):.2f}" if balance else "$0.00"
 
         trend_str = "BULL" if self.trend == 1 else "BEAR" if self.trend == -1 else "RANGE"
         wr = int(self.win_count / (self.win_count + self.loss_count) * 100) if (self.win_count + self.loss_count) > 0 else 0
 
+        # Compression indicator
+        compression_str = "🔥COMP" if self.compression_active else ""
+
+        # Funding rate and bias
+        funding_str = f"FR={float(self.funding_rate)*100:.3f}%"
+        bias_str = "⬆️LONG" if self.funding_bias == 1 else "⬇️SHORT" if self.funding_bias == -1 else "⚖️NEUTRAL"
+
+        # Liquidation clusters
+        liq_str = f"liq={len(self.liquidation_clusters)}"
+
         self.logger().info(
             f"[FH2] {self.current_session} | {trend_str} | "
-            f"price=${price:.0f} | "
+            f"price=${price:.0f} | bal={balance_str} | "
             f"pnl=${float(self.total_pnl):.2f} wr={wr}% | "
             f"session={self.session_trades}/{self.max_trades_per_session} losses={self.session_losses} | "
-            f"key_levels={len(self.key_levels)} liq_pools={len(self.liquidity_pools)}"
+            f"key_levels={len(self.key_levels)} liq_pools={len(self.liquidity_pools)} | "
+            f"{compression_str} {funding_str} {bias_str} {liq_str}"
         )
 
 
